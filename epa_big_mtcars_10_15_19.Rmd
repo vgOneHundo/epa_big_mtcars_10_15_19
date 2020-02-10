@@ -1,0 +1,190 @@
+---
+title: "EPA Big MTCars"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+theme_set(theme_light())
+```
+
+```{r}
+big_epa_cars <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2019/2019-10-15/big_epa_cars.csv") %>% 
+      mutate(uses_electricity = ifelse(highwayE > 0, "Uses Electricity", "Doesn't Use Electricity"))
+```
+
+
+```{r}
+big_epa_cars %>%
+      ggplot(aes(highway08, city08)) + 
+      geom_point() + 
+      geom_abline(color = "red") +
+      facet_wrap(~ uses_electricity, scales = "free") + 
+      expand_limits(x = 0, y = 0) + 
+      labs(x = "Highway MPG", 
+           y = "City MPG", 
+           title = "How does fuel efficiency differ between city + highway?")
+```
+
+```{r}
+# select columns to work with
+big_epa_cars %>%
+      select(city08, highway08, make, model, cylinders, 
+             displ, drive, engId, eng_dscr)
+```
+
+```{r}
+big_epa_cars %>%
+      filter(cityE == 0) %>%
+      mutate(VClass = fct_lump(VClass, 8), #lump data into 8 categories
+            VClass = fct_reorder(VClass, city08)) %>%
+      ggplot(aes(VClass, city08)) + 
+      geom_boxplot() + 
+      coord_flip()
+
+big_epa_cars %>%
+      filter(cityE == 0) %>%
+      ggplot(aes(cylinders, city08, group = cylinders)) + 
+      geom_boxplot() 
+
+big_epa_cars %>%
+      filter(cityE == 0) %>%
+      ggplot(aes(displ, city08)) + 
+      geom_point() + 
+      expand_limits(x = 0, y = 0)
+```
+
+## Goal: Predict city fuel efficiency for single-fuel, non-electric efficiency cars
+
+```{r}
+# Cross validation holdout set
+non_electric_cars <- big_epa_cars %>%
+      filter(cityA08 == 0, 
+             cityE == 0) %>%
+      sample_frac(1) # rearranges rows in the data
+
+training_set <- non_electric_cars %>%
+      filter(row_number() %% 5 != 0)
+```
+
+```{r}
+library(broom) # package for exploring models
+
+## augment function from broom adds extra variables to the data, like residual values
+
+training_set %>%
+      ggplot(aes(displ, city08)) + 
+      geom_point() + 
+      geom_smooth(method = "lm")
+
+library(splines)
+
+# load splines library to use ns function: generates a basis matrix for natural cubic splines (essentially makes data have 2 degrees of freedom)
+
+# spline allows wider variation of curved shapes between x and y while still using a linear model
+
+augmented_data <- lm(city08 ~ ns(displ, 2), data = training_set) %>%
+      augment(data = training_set) 
+
+## lm returns a p value of -2.6, where every extra liter of displacement reduces fuel efficiency by 2.6 mpg
+
+## creating a scatterplot of aes(displ, .resid) outputs a parabole, need to have a random pattern to train our model, shows that a linear model is not a good fit for our data
+
+augmented_data %>%
+      ggplot(aes(displ, city08)) + 
+      geom_point() + 
+      geom_line(aes(y = .fitted), color = "red", size = 1)
+
+models <- tibble(df = 1:6) %>%    #place 6 degrees of freedom
+      mutate(lm_model = map(df, ~lm(city08 ~ ns(displ, df = .), data = training_set)))
+
+#fit a linear model (lm) of city08 explained by displacement with a natural cubic spline with several degrees of freedom, similar to code used earlier but with different degrees of freedom
+
+augmented_unnested <- models %>%
+      mutate(augmented = map(lm_model, augment, data = training_set)) %>% 
+      unnest(augmented)
+
+augmented_unnested %>% 
+      ggplot(aes(displ, city08)) + 
+      geom_point(data = training_set) + 
+      geom_line(aes(y = .fitted, color = factor(df)), size = 2) +
+      labs(x = "Engine volume (L)", 
+           y = "City MPG", 
+           color = "# of degrees of freedom") + 
+      expand_limits(x = 0, y = 0)
+# with 6 degrees of freedom, have a nice trend line that fits the model
+
+augmented_unnested %>% 
+   ggplot(aes(displ, .resid)) + 
+   geom_point() + 
+   facet_wrap(~ df)
+
+# did the models get better?
+glanced_models <- models %>% 
+   rename(spline_df = df) %>% # renamed to have output be dm
+   mutate(glanced = map(lm_model, glance, data = training_set)) %>% 
+   unnest(glanced)
+   
+glanced_models %>% 
+   ggplot(aes(spline_df, adj.r.squared)) + 
+   geom_line()
+# graph shows we benefit most from first 4 degrees of freedom
+```
+
+```{r}
+# add 4 degrees of freedom based on previous results
+# adding non-linear terms to the equation
+lm(city08 ~ ns(displ, 4), data = training_set) %>%
+   anova() %>% # will tell if displ explains variation vs chance
+   tidy() %>% # used to get sum of squares
+   mutate(pct_variation = sumsq / sum(sumsq)) 
+# result: 62% of variation explained by displ
+
+ggplot(training_set, aes(cylinders, displ, group = cylinders)) + 
+   geom_boxplot()
+```
+
+```{r}
+# have cars been getting more efficient over time?
+#training_set %>% 
+   #ggplot(aes(year, city08, group = year)) + 
+   #geom_point() + 
+   #geom_smooth(method = "loess") # loess used to view non-linear trends, looks at local regression values on sliding scale
+
+efficiency_time <- training_set %>% 
+   mutate(VClass = fct_lump(VClass, 6), 
+          guzzler = !is.na(guzzler)) %>% 
+   group_by(year = 2 * floor(year / 2), VClass) %>% # group by 2 years to smooth line
+   summarize_at(vars(city08, cylinders, displ, guzzler), mean)
+
+efficiency_time %>% 
+   ggplot(aes(year, city08, color = VClass)) + 
+   geom_line() + 
+   expand_limits(y = 0)
+# result: see boost begining in 2010, mostly in mid-size and compact cars
+
+# has engine size changed?
+efficiency_time %>% 
+   ggplot(aes(year, displ, color = VClass)) + 
+   geom_line() + 
+   expand_limits(y = 0)
+# result: mid size and large cars have seen a drop in size
+
+#change in cars that are "guzzlers"
+efficiency_time %>% 
+   ggplot(aes(year, guzzler, color = VClass)) + 
+   geom_line() + 
+   expand_limits(y = 0)
+# results: drop to 0
+```
+
+Hypothesis: 
+Engine size started shrinking around 2009, especially in large an midsize cars. This lead an increate in city fuel efficiency
+
+
